@@ -1,0 +1,261 @@
+# Copyright 2022 IBM.com. All Rights Reserved.
+#Author: Reza Beykzadeh
+
+AWSTemplateFormatVersion:          2010-09-09
+Description:                       Sets up EC2 image builder to create STIG AMI.
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The ID of the VPC where the EC2 instances will be launched.
+  VpcCidr:
+    Type: String
+    Description: The CIDR block of the VPC where the EC2 instances will be launched.
+  DemoSubnetIds:
+    Type: AWS::EC2::Subnet::Id
+    Description: The IDs of the subnets where the EC2 instances will be launched.
+  STIGArtifactsBukcet:
+    Type: String
+    Description: The name of the S3 bucket where STIG artifacts will be stored.
+  BuildInstanceType:
+    Type: String
+    Default: t3.medium
+    Description: Instance type for EC2 instances used to build the AMI
+    AllowedValues:
+      - t2.micro
+      - t2.small
+      - t2.medium
+      - t2.large
+      - t3.nano
+      - t3.micro
+      - t3.small
+      - t3.medium
+      - t3.large
+
+Resources:
+  # Create an S3 Bucket for logs.
+  ImageBuilderLogBucket:
+    Type: AWS::S3::Bucket
+
+  # This grants AWS Systems Manager (SSM) and EC2 Image Builder the necessary permissions to build an image.
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Metadata:
+      Comment: Role to be used by instance during image build.
+    Properties:
+      ManagedPolicyArns:
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/AmazonSSMManagedInstanceCore
+        - Fn::Sub: arn:${AWS::Partition}:iam::aws:policy/EC2InstanceProfileForImageBuilder
+      AssumeRolePolicyDocument:
+        Statement:
+          - Action:
+              - sts:AssumeRole
+            Effect: Allow
+            Principal:
+              Service:
+                - ec2.amazonaws.com
+        Version: "2012-10-17"
+      Path: /executionServiceEC2Role/
+
+  InstanceSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Allow https within VPC for SSM Sessions Manager
+      VpcId:  !Ref VpcId
+      SecurityGroupIngress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: !Ref VpcCidr
+      SecurityGroupEgress:
+      - IpProtocol: tcp
+        FromPort: 443
+        ToPort: 443
+        CidrIp: 0.0.0.0/0
+
+  
+  # Policy to allow the instance to write to the S3 bucket (via instance role / instance profile).
+  InstanceRoleLoggingPolicy:
+    Type: AWS::IAM::Policy
+    Metadata:
+      Comment: Allows the instance to place log files to an S3 bucket.
+    Properties:
+      PolicyName: ImageBuilderLogBucketPolicy
+      Roles:
+        - Ref: InstanceRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Action:
+              - s3:PutObject
+              - s3:GetObject
+              - s3:ListObject
+            Effect: Allow
+            Resource:
+              - Fn::Sub:
+                  - arn:${AWS::Partition}:s3:::${BUCKET}/*
+                  - BUCKET:
+                      Ref: ImageBuilderLogBucket
+              - Fn::Sub:
+                  - arn:${AWS::Partition}:s3:::${BUCKET}/*
+                  - BUCKET: !Ref STIGArtifactsBukcet
+
+  # To pass the InstanceRole to an EC2 instance, we need an InstanceProfile.
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Path: /executionServiceEC2Role/
+      Roles:
+        - Ref: InstanceRole
+
+  # Key for encryption
+  ec2ImageBuilderKey:
+    Type: AWS::KMS::Key
+    Properties:
+      Description: Key to use for EBS encryption
+      KeyPolicy:
+        Version: '2012-10-17'
+        Statement:
+          - Sid: Enable IAM User Permissions
+            Effect: Allow
+            Principal:
+              AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"
+            Action: kms:*
+            Resource: '*'
+      KeyUsage: ENCRYPT_DECRYPT
+      EnableKeyRotation: true
+
+  # Key alias
+  ec2KeyAlias:
+    Type: AWS::KMS::Alias
+    Properties:
+      AliasName: !Join
+        - ''
+        - - 'alias/'
+          - !Ref "AWS::StackName"
+          - key
+      TargetKeyId: !Ref ec2ImageBuilderKey
+  
+  DownloadSTIGComponent:
+    Type: 'AWS::ImageBuilder::Component'
+    Properties:
+      Name: 'download-stig-components'
+      Platform: 'Linux'
+      Version: "1.0.4"
+      Description: 'Download STIG'
+      ChangeDescription: 'Download STIG into EC2'
+      # Require one of 'Data' or 'Uri' for Component template
+      Data: |
+        name: Download file from rhel git
+        description: 'Download stig package from rhel github to EC2'
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps: 
+              - name: InstallAnsible
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo yum clean all
+                    - sudo yum update -y 
+                    - sudo yum install -y wget
+                    - cd /tmp; wget https://github.com/RedHatGov/rhel8-stig-latest/raw/master/rhel8-playbook-stig.yml
+      
+  STIGComponent:
+    Type: 'AWS::ImageBuilder::Component'
+    Properties:
+      Name: 'stig-components'
+      Platform: 'Linux'
+      Version: "1.0.4"
+      Description: 'Apply STIG'
+      ChangeDescription: 'Apply STIG to EC2 Instance'
+      # Require one of 'Data' or 'Uri' for Component template
+      Data: |
+        name: 'STIG Script Execution on RHEL 8'
+        description: 'This is a STIG component to download and execute STIG script against Amazon RHEL 8.'
+        schemaVersion: 1.0
+        phases:
+          - name: build
+            steps:
+              - name: InstallAnsible
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - sudo yum install -y https://dl.fedoraproject.org/pub/epel/epel-release-latest-8.noarch.rpm
+                    - sudo rpm --import https://dl.fedoraproject.org/pub/epel/RPM-GPG-KEY-EPEL-8
+                    - sudo yum install -y ansible
+              - name: SetPermissions
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - chmod +x /tmp/rhel8-playbook-stig.yml
+              - name: RunPlaybook
+                action: ExecuteBash
+                inputs:
+                  commands:
+                    - ansible-playbook --connection=local --inventory 127.0.0.1, --limit 127.0.0.1 rhel8-playbook-stig.yml
+
+  ImagePipeline:
+    Type: 'AWS::ImageBuilder::ImagePipeline'
+    Properties:
+      Name: 'rhel-stig-image-pipeline'
+      Description: 'Build RHEL STIG Instance'
+      ImageRecipeArn: !Ref STIGImageRecipe
+      InfrastructureConfigurationArn: !Ref InfrastructureConfiguration
+      ImageScanningConfiguration:
+        ImageScanningEnabled: false
+      ImageTestsConfiguration:
+        ImageTestsEnabled: false
+        TimeoutMinutes: 60
+      #Schedule:
+      #  ScheduleExpression: 'cron(0 0 * * ? *)'
+      #  PipelineExecutionStartCondition: 'EXPRESSION_MATCH_ONLY'
+      Status: 'ENABLED'
+      Tags:
+        Name: 'STIG-Image-Pipeline'
+  
+  STIGImageRecipe:
+    Type: 'AWS::ImageBuilder::ImageRecipe'
+    DependsOn:
+      - ec2ImageBuilderKey
+      - ec2KeyAlias
+    Properties:
+      AdditionalInstanceConfiguration:
+        SystemsManagerAgent:
+          UninstallAfterBuild: false
+      Name: 'stig-image-recipe'
+      Version: "1.0.4"
+      ParentImage: !Sub arn:${AWS::Partition}:imagebuilder:${AWS::Region}:aws:image/red-hat-enterprise-linux-8-x86/x.x.x
+      Description: 'Creates STIG AMI'
+      BlockDeviceMappings:
+        - DeviceName: /dev/sda1
+          Ebs:
+            DeleteOnTermination: false
+            Encrypted: true
+            KmsKeyId: !Ref ec2ImageBuilderKey
+            VolumeType: "gp3"
+            VolumeSize: 20
+      Components:
+        - ComponentArn: !Ref DownloadSTIGComponent
+        - ComponentArn: !Ref STIGComponent
+      Tags:
+        Name: 'STIG-Image-Recipe'
+
+  InfrastructureConfiguration:
+    Type: 'AWS::ImageBuilder::InfrastructureConfiguration'
+    Properties:
+      Name: 'STIG-Image-Builder-Infrastructure'
+      InstanceProfileName: !Ref InstanceProfile
+      Description: 'Creates Infrastructure for STIG AMI'
+      InstanceTypes:
+        - !Ref BuildInstanceType
+      KeyPair: 'imagebuilder'
+      Logging:
+        S3Logs:
+          S3BucketName:
+            Ref: ImageBuilderLogBucket
+          S3KeyPrefix: !Join [ "-", [ 'imagebuilder', !Ref "AWS::StackName" ] ]
+      TerminateInstanceOnFailure: true
+      SecurityGroupIds: 
+        - !GetAtt InstanceSecurityGroup.GroupId
+      SubnetId: !Ref DemoSubnetIds
