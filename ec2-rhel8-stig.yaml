@@ -1,4 +1,4 @@
-# Copyright 2022 IBM.com. All Rights Reserved.
+# Copyright 2025 IBM.com. All Rights Reserved.
 #Author: Reza Beykzadeh
 
 AWSTemplateFormatVersion:          2010-09-09
@@ -69,8 +69,12 @@ Resources:
         CidrIp: !Ref VpcCidr
       SecurityGroupEgress:
       - IpProtocol: tcp
-        FromPort: 443
-        ToPort: 443
+        FromPort: 0
+        ToPort: 65535
+        CidrIp: 0.0.0.0/0
+      - IpProtocol: udp
+        FromPort: 0
+        ToPort: 65535
         CidrIp: 0.0.0.0/0
 
   
